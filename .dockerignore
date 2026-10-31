@@ -1,0 +1,8 @@
+.git
+.github
+*.md
+docs
+monitoring
+scripts
+data
+# myapp НЕ исключаем: стадия "artifact" берёт готовый бинарник

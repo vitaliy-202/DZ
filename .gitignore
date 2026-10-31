@@ -1,0 +1,4 @@
+data/
+myapp
+*.log
+.env

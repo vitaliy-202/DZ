@@ -6,10 +6,15 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
+	"sort"
 	"sync"
 	"time"
 )
+
+var startedAt = time.Now()
 
 // Структура заметки
 type Note struct {
@@ -28,6 +33,78 @@ type Storage struct {
 var db = Storage{
 	notes:  make(map[int]Note),
 	nextID: 1,
+}
+
+// Файл с заметками лежит в DATA_DIR (в контейнере это /data — постоянный том),
+// поэтому заметки переживают перезапуск и обновление приложения.
+type fileFormat struct {
+	NextID int    `json:"next_id"`
+	Notes  []Note `json:"notes"`
+}
+
+func dataFile() string {
+	dir := os.Getenv("DATA_DIR")
+	if dir == "" {
+		dir = "./data"
+	}
+	return filepath.Join(dir, "notes.json")
+}
+
+// load читает заметки с диска при старте (если файла ещё нет — это нормально).
+func (s *Storage) load(path string) error {
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var ff fileFormat
+	if err := json.Unmarshal(raw, &ff); err != nil {
+		return fmt.Errorf("файл %s повреждён: %w", path, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.notes = make(map[int]Note, len(ff.Notes))
+	s.nextID = 1
+	for _, n := range ff.Notes {
+		s.notes[n.ID] = n
+		if n.ID >= s.nextID {
+			s.nextID = n.ID + 1
+		}
+	}
+	if ff.NextID > s.nextID {
+		s.nextID = ff.NextID
+	}
+	return nil
+}
+
+// saveLocked записывает заметки на диск. Вызывать, удерживая s.mu.
+// Пишем во временный файл и переименовываем — файл не будет «наполовину записан».
+func (s *Storage) saveLocked() {
+	path := dataFile()
+	ff := fileFormat{NextID: s.nextID}
+	for _, n := range s.notes {
+		ff.Notes = append(ff.Notes, n)
+	}
+	data, err := json.MarshalIndent(ff, "", "  ")
+	if err == nil {
+		if err = os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
+			tmp := path + ".tmp"
+			if err = os.WriteFile(tmp, data, 0o644); err == nil {
+				err = os.Rename(tmp, path)
+			}
+		}
+	}
+	if err != nil {
+		log.Printf("не удалось сохранить заметки: %v", err)
+	}
+}
+
+func (s *Storage) count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.notes)
 }
 
 // Для подсчета посещений за последний час
@@ -149,6 +226,10 @@ var tmpl = template.Must(template.New("index").Parse(`
 
 // Главная страница
 func homeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" { // /favicon.ico и прочие несуществующие пути — не посещения
+		http.NotFound(w, r)
+		return
+	}
 	trackVisit()
 
 	db.mu.RLock()
@@ -157,6 +238,7 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		notesList = append(notesList, n)
 	}
 	db.mu.RUnlock()
+	sort.Slice(notesList, func(i, j int) bool { return notesList[i].ID < notesList[j].ID })
 
 	// Сбор данных о памяти
 	var m runtime.MemStats
@@ -187,6 +269,7 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 		db.mu.Lock()
 		db.notes[db.nextID] = Note{ID: db.nextID, Title: title, Content: content}
 		db.nextID++
+		db.saveLocked()
 		db.mu.Unlock()
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -205,6 +288,7 @@ func editHandler(w http.ResponseWriter, r *http.Request) {
 			note.Title = title
 			note.Content = content
 			db.notes[id] = note
+			db.saveLocked()
 		}
 		db.mu.Unlock()
 	}
@@ -218,7 +302,10 @@ func deleteHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Sscanf(r.FormValue("id"), "%d", &id)
 
 		db.mu.Lock()
-		delete(db.notes, id)
+		if _, exists := db.notes[id]; exists {
+			delete(db.notes, id)
+			db.saveLocked()
+		}
 		db.mu.Unlock()
 	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
@@ -243,6 +330,14 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 		"ram_sys_mb":      m.Sys / 1024 / 1024,
 		"num_cpu":         runtime.NumCPU(),
 		"goroutines":      runtime.NumGoroutine(),
+		"notes":           db.count(),
+		"uptime_seconds":  int(time.Since(startedAt).Seconds()),
+	}
+	if v, ok := readFloatFile("/sys/fs/cgroup/memory.current"); ok { // ресурсы контейнера (cgroup v2)
+		metrics["container_memory_used_mb"] = int(v / 1024 / 1024)
+	}
+	if v, ok := readFloatFile("/sys/fs/cgroup/memory.max"); ok {
+		metrics["container_memory_limit_mb"] = int(v / 1024 / 1024)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -250,16 +345,24 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	if err := db.load(dataFile()); err != nil {
+		log.Fatalf("не удалось загрузить заметки: %v", err)
+	}
 	http.HandleFunc("/", homeHandler)
 	http.HandleFunc("/add", addHandler)
 	http.HandleFunc("/edit", editHandler)
 	http.HandleFunc("/delete", deleteHandler)
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/metrics/prometheus", prometheusHandler) // тот же набор данных в формате Prometheus
 
 	port := ":8080"
+	if p := os.Getenv("PORT"); p != "" {
+		port = ":" + p
+	}
 	log.Printf("Сервер запущен на http://localhost%s", port)
-	if err := http.ListenAndServe(port, nil); err != nil {
+	srv := &http.Server{Addr: port, ReadHeaderTimeout: 5 * time.Second}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }

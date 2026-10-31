@@ -1,50 +1,94 @@
+# CI/CD: тесты -> сборка артефакта -> упаковка в контейнер -> проверка контейнера -> (деплой)
+#
+# Деплой на Amvera: сервис пересобирается из этого же репозитория по каждому push в main
+# (интеграция Amvera с GitHub), используя тот же Dockerfile и amvera.yml.
+# Данные хранятся в постоянном хранилище /data (persistenceMount в amvera.yml).
 name: CI/CD Pipeline
 
 on:
   push:
     branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  VERSION: 1.0.${{ github.run_number }}
 
 jobs:
-  build:
-    name: Build Go Binary Artifact
+  test:
+    name: 1. Тесты
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
-
-      - name: Build Binary
+          go-version-file: go.mod
+      - name: gofmt, go vet, go test
         run: |
-          go mod tidy
-          CGO_ENABLED=0 GOOS=linux go build -o myapp main.go
+          test -z "$(gofmt -l .)" || { echo "Не отформатировано (gofmt -w .):"; gofmt -l .; exit 1; }
+          go vet ./...
+          go test -race -count=1 ./...
 
-      - name: Upload Binary Artifact
+  build:
+    name: 2. Сборка артефакта
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Собрать бинарник
+        run: bash scripts/build.sh
+      - name: Сохранить артефакт
         uses: actions/upload-artifact@v4
         with:
           name: go-binary-artifact
-          path: myapp
+          path: |
+            myapp
+            myapp.sha256
+          if-no-files-found: error
+          retention-days: 30
 
-  dockerize:
-    name: Package into Container
+  package:
+    name: 3. Упаковка в контейнер
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Download Binary Artifact
+      - name: Скачать артефакт, собранный на предыдущем шаге
         uses: actions/download-artifact@v4
         with:
           name: go-binary-artifact
           path: .
 
-      - name: Make binary executable
-        run: chmod +x myapp
+      - name: Проверить контрольную сумму артефакта
+        run: sha256sum -c myapp.sha256
 
-      - name: Build Docker Image
+      - name: Упаковать артефакт в образ (Dockerfile, target=artifact)
+        run: docker build --target artifact -t dz-app:${VERSION} -t dz-app:latest .
+
+      - name: Запустить контейнер и проверить его (smoke-тест)
         run: |
-          docker build -t myapp:latest .
+          docker run -d --name smoke -p 8080:8080 -v smoke-data:/data dz-app:${VERSION}
+          bash scripts/smoke.sh http://localhost:8080 || { docker logs smoke; exit 1; }
+
+      - name: Проверить, что данные переживают пересоздание контейнера
+        run: |
+          curl -fsS -o /dev/null -d 'title=persist&content=check' http://localhost:8080/add
+          docker rm -f smoke
+          docker run -d --name smoke2 -p 8080:8080 -v smoke-data:/data dz-app:${VERSION}
+          for _ in $(seq 1 20); do curl -fsS -o /dev/null http://localhost:8080/health 2>/dev/null && break; sleep 1; done
+          curl -fsS http://localhost:8080/ | grep -q 'value="persist"' || { echo "данные потеряны"; exit 1; }
+          echo "✅ заметка сохранилась после пересоздания контейнера"
+
+      - name: Проверить статус healthy
+        run: |
+          for _ in $(seq 1 20); do
+            s="$(docker inspect -f '{{.State.Health.Status}}' smoke2)"; [ "$s" = healthy ] && break; sleep 3
+          done
+          echo "health status: $s"; [ "$s" = healthy ]
