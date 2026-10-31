@@ -29,7 +29,7 @@ bash scripts/run-local.sh
 
 1. **Тесты** — gofmt, go vet, go test.
 2. **Сборка артефакта** — `scripts/build.sh` собирает статический бинарник `myapp` (+ контрольная сумма); он сохраняется как артефакт запуска (Actions → Artifacts → `go-binary-artifact`).
-3. **Упаковка в контейнер** — скачивается *тот же* артефакт, проверяется контрольная сумма, `Dockerfile` (стадия `artifact`) кладёт его в образ. Затем контейнер запускается, проходит smoke-тест (`scripts/smoke.sh`: health, страница, создание/правка/удаление заметки, метрики), пересоздаётся с тем же томом — проверяется, что данные сохранились, — и должен стать `healthy`.
+3. **Упаковка в контейнер** — скачивается *тот же* артефакт, проверяется контрольная сумма, `Dockerfile.artifact` кладёт его в образ. Затем контейнер запускается, проходит smoke-тест (`scripts/smoke.sh`: health, страница, создание/правка/удаление заметки, метрики), пересоздаётся с тем же томом — проверяется, что данные сохранились, — и должен стать `healthy`.
 4. **Деплой** — Amvera пересобирает сервис из репозитория по тому же `Dockerfile` и `amvera.yml` и запускает его с постоянным хранилищем `/data`.
 
 ## Сохранение данных
@@ -49,4 +49,4 @@ bash scripts/run-local.sh
 
 ## Файлы
 
-`Dockerfile` — описание контейнера · `docker-compose.yml` — приложение + Prometheus + Grafana + node-exporter · `scripts/build.sh` — сборка · `scripts/smoke.sh` — проверка · `scripts/run-local.sh` — запуск всего · `amvera.yml` — конфигурация Amvera.
+`Dockerfile` — описание контейнера (сборка из исходников), `Dockerfile.artifact` — упаковка готового артефакта в CI · `docker-compose.yml` — приложение + Prometheus + Grafana + node-exporter · `scripts/build.sh` — сборка · `scripts/smoke.sh` — проверка · `scripts/run-local.sh` — запуск всего · `amvera.yml` — конфигурация Amvera.

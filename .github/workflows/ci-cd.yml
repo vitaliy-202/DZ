@@ -69,8 +69,8 @@ jobs:
       - name: Проверить контрольную сумму артефакта
         run: sha256sum -c myapp.sha256
 
-      - name: Упаковать артефакт в образ (Dockerfile, target=artifact)
-        run: docker build --target artifact -t dz-app:${VERSION} -t dz-app:latest .
+      - name: Упаковать артефакт в образ (Dockerfile.artifact)
+        run: docker build -f Dockerfile.artifact -t dz-app:${VERSION} -t dz-app:latest .
 
       - name: Запустить контейнер и проверить его (smoke-тест)
         run: |
